@@ -7,6 +7,15 @@ benefit.py — Qoder 每日签到 / 用量查询（全自动，无需浏览器�
 3. POST /sash/api/v1/me/campaigns/{campaignId}/claim 直接领取
 4. 按活动对象里的 endAt（本轮截止）排下一次检查；没到截止前不重复打接口
 """
+# 作为独立入口（python lanes/benefit.py）运行时仓库根不在 sys.path 上，
+# 兜底把仓库根加进来，否则 `from lanes import qoder_cosy` 失败。
+import os as _os
+import sys as _sys
+
+_ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+if _ROOT not in _sys.path:
+    _sys.path.insert(0, _ROOT)
+
 import os
 import json
 import socket
@@ -17,7 +26,7 @@ from pathlib import Path
 
 import requests
 
-from lanes import qoder_cosy
+from lanes import qoder_cosy  # noqa: E402
 
 # CN 时区 UTC+8
 CN_TZ = timezone(timedelta(hours=8))
