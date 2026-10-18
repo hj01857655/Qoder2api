@@ -14,7 +14,9 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="repla
 os.environ["DUMP"] = "0"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
+sys.path.insert(0, ROOT)
 
 import requests  # noqa: E402
 
@@ -29,8 +31,8 @@ class Capture(logging.Handler):
 logging.getLogger().handlers = [Capture()]
 logging.getLogger().setLevel(logging.DEBUG)
 
-import qoder_cosy  # noqa: E402
-import server      # noqa: E402
+from lanes import qoder_cosy  # noqa: E402
+import server                 # noqa: E402
 
 passed, failed = [], []
 

@@ -17,7 +17,7 @@ from pathlib import Path
 
 import requests
 
-import qoder_cosy
+from lanes import qoder_cosy
 
 # CN 时区 UTC+8
 CN_TZ = timezone(timedelta(hours=8))

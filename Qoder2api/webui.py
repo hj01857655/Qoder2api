@@ -10,8 +10,7 @@ from datetime import datetime, timezone
 
 from flask import jsonify, request
 
-import benefit
-import qoder_cosy
+from lanes import benefit, qoder_cosy
 
 logger = logging.getLogger(__name__)
 

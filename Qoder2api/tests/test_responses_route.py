@@ -7,6 +7,10 @@ monkeypatch 掉 qoder_cosy.run_qoder_cosy / _openai_usage，覆盖：
   3. /v1/chat/completions 流式回归：_chat_direct_lines 抽取不破坏老路由
 """
 import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import server
 

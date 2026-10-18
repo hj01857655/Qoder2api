@@ -20,10 +20,13 @@ from logging.handlers import RotatingFileHandler
 
 from flask import Flask, Response, g, jsonify, request
 
-import benefit
-import qoder_cosy
-import responses_bridge as rb
-import anthropic_bridge as ab
+from adapters import anthropic, responses
+from lanes import benefit, qoder_cosy
+from routes import chat, completions, messages, responses as routes_responses
+
+# 兼容别名：旧探针/测试引用的旧模块名（anthropic_bridge / responses_bridge）
+anthropic_bridge = anthropic
+responses_bridge = responses
 
 app = Flask(__name__)
 
@@ -226,7 +229,7 @@ def _error_payload(err_type, path):
     if "/messages" in path:
         # 多半是 Anthropic 客户端 base URL 多带了 /v1，与服务端 /v1/messages 叠加
         msg += "（Anthropic 客户端 base URL 应填 host:port，不含 /v1）"
-        return ab.error_body(err_type, msg)
+        return anthropic.error_body(err_type, msg)
     return {"error": {"message": msg, "type": err_type}}
 
 
@@ -325,162 +328,6 @@ def _retry_wait(e, elapsed: float = 0.0) -> float:
     return conn_wait
 
 
-# ── 聊天补全 ──────────────────────────────────────────────────────────────────
-@app.route("/v1/chat/completions", methods=["POST"])
-def chat_completions():
-    body = request.get_json(silent=True) or {}
-    messages = body.get("messages", [])
-    model_req = body.get("model", "auto")
-    stream = body.get("stream", False)
-    max_tokens = body.get("max_tokens")
-    temperature = body.get("temperature")
-    top_p = body.get("top_p")
-    top_k = body.get("top_k")
-    context_length = body.get("context_length")
-    tools = body.get("tools") or None
-    tool_choice = body.get("tool_choice")
-    parallel_tool_calls = body.get("parallel_tool_calls")
-    reasoning_effort = body.get("reasoning_effort")
-    enable_thinking = body.get("enable_thinking")  # 客户端显式开关思考（false 时省掉 reasoning token）
-    preserve_thinking = body.get("preserve_thinking")
-    reasoning_budget_tokens = body.get("reasoning_budget_tokens")
-    include_usage = bool((body.get("stream_options") or {}).get("include_usage"))
-
-    if not messages:
-        return jsonify({"error": {"message": "messages is required", "type": "invalid_request_error"}}), 400
-
-    if isinstance(tool_choice, str) and tool_choice not in ("auto", "none", "required"):
-        logger.warning("[%s] tool_choice=%r 非 OpenAI 取值，不送上游",
-                       getattr(g, "rid", "?"), tool_choice)
-
-    cid = f"chatcmpl-{uuid.uuid4().hex}"
-    now = int(time.time())
-
-    if stream:
-        return _stream_chat_direct(messages, model_req, cid, now, temperature, max_tokens,
-                                   top_p=top_p, top_k=top_k, context_length=context_length,
-                                   tools=tools, tool_choice=tool_choice,
-                                   parallel_tool_calls=parallel_tool_calls,
-                                   reasoning_effort=reasoning_effort,
-                                   enable_thinking=enable_thinking,
-                                   reasoning_budget_tokens=reasoning_budget_tokens,
-                                   preserve_thinking=preserve_thinking,
-                                   include_usage=include_usage)
-    return _full_chat_direct(messages, model_req, cid, now, max_tokens, temperature,
-                             top_p=top_p, top_k=top_k, context_length=context_length,
-                             tools=tools, tool_choice=tool_choice,
-                             parallel_tool_calls=parallel_tool_calls,
-                             reasoning_effort=reasoning_effort,
-                             enable_thinking=enable_thinking,
-                             reasoning_budget_tokens=reasoning_budget_tokens,
-                             preserve_thinking=preserve_thinking)
-
-
-# ── OpenAI Responses 端点（grok-build / Codex 等原生 Responses 客户端）──────
-# 上游仍是 COSY 事件流：请求体经 responses_bridge 转成 Chat，与 chat 共用同一
-# 事件源与 Chat SSE 行帧化（_chat_direct_lines），响应侧包成 Responses SSE
-# （每帧带 sequence_number）。
-@app.route("/v1/responses", methods=["POST"])
-def responses_api():
-    body = request.get_json(silent=True)
-    if not isinstance(body, dict) or not body:
-        return jsonify({"error": {"message": "invalid request: JSON object body required",
-                                  "type": "invalid_request_error"}}), 400
-
-    chat_body = rb.responses_to_chat(body)
-    messages = chat_body.get("messages", [])
-    if not messages:
-        return jsonify({"error": {"message": "invalid request: 'input' is required",
-                                  "type": "invalid_request_error"}}), 400
-
-    model_req = body.get("model", "auto")
-    stream = bool(body.get("stream"))
-    max_tokens = chat_body.get("max_tokens")
-    temperature = chat_body.get("temperature")
-    top_p = chat_body.get("top_p")
-    tools = chat_body.get("tools")
-    tool_choice = chat_body.get("tool_choice")
-    parallel_tool_calls = chat_body.get("parallel_tool_calls")
-    cid = "chatcmpl-" + uuid.uuid4().hex
-    now = int(time.time())
-    rid, t0 = g.rid, g.t0
-
-    if stream:
-        # responses 必须带 usage：强制 include_usage，让 bridge 拿到 token 数
-        lines = _chat_direct_lines(messages, model_req, cid, now, rid, t0,
-                                   temperature=temperature, max_tokens=max_tokens,
-                                   top_p=top_p, tools=tools, tool_choice=tool_choice,
-                                   parallel_tool_calls=parallel_tool_calls,
-                                   include_usage=True)
-
-        def generate():
-            # Qoder 的 _stream_log 按 str 攒帧落盘（chat 路径也是 str 帧），边界解码
-            for frame in rb.chat_sse_to_responses(lines, model_req):
-                yield frame.decode("utf-8")
-
-        return Response(_stream_log(generate(), rid, t0, ttft_skip=2), mimetype="text/event-stream",
-                        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-
-    result = _full_chat_direct(messages, model_req, cid, now, max_tokens, temperature,
-                               top_p=top_p, tools=tools, tool_choice=tool_choice,
-                               parallel_tool_calls=parallel_tool_calls)
-    if result.status_code != 200:
-        return result
-    chat_json = json.loads(result.get_data())
-    return jsonify(rb.chat_json_to_responses(chat_json, model_req))
-
-
-# ── Anthropic Messages 端点（Claude Code 等原生 Anthropic 客户端）──────────────
-# 与 /v1/responses 同构：anthropic_bridge 把 Anthropic ⇄ Chat 翻掉，复用
-# qoder_cosy 直连；响应侧包成 Anthropic SSE。
-@app.route("/v1/messages", methods=["POST"])
-def messages_api():
-    body = request.get_json(silent=True)
-    if not isinstance(body, dict) or not body:
-        return jsonify(ab.error_body("invalid_request_error",
-            "invalid request: JSON object body required")), 400
-
-    chat_body = ab.anthropic_to_chat(body)
-    messages = chat_body.get("messages", [])
-    if not messages:
-        return jsonify(ab.error_body("invalid_request_error",
-            "invalid request: 'messages' is required")), 400
-
-    model_req = body.get("model", "auto")
-    stream = bool(body.get("stream"))
-    max_tokens = chat_body.get("max_tokens")
-    temperature = chat_body.get("temperature")
-    top_p = chat_body.get("top_p")
-    tools = chat_body.get("tools")
-    tool_choice = chat_body.get("tool_choice")
-    parallel_tool_calls = chat_body.get("parallel_tool_calls")
-    cid = "chatcmpl-" + uuid.uuid4().hex
-    now = int(time.time())
-    rid, t0 = g.rid, g.t0
-
-    if stream:
-        lines = _chat_direct_lines(messages, model_req, cid, now, rid, t0,
-                                   temperature=temperature, max_tokens=max_tokens,
-                                   top_p=top_p, tools=tools, tool_choice=tool_choice,
-                                   parallel_tool_calls=parallel_tool_calls,
-                                   include_usage=True)
-
-        def generate():
-            for frame in ab.chat_sse_to_anthropic(lines, model_req):
-                yield frame.decode("utf-8")
-
-        return Response(_stream_log(generate(), rid, t0, ttft_skip=1), mimetype="text/event-stream",
-                        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-
-    result = _full_chat_direct(messages, model_req, cid, now, max_tokens, temperature,
-                               top_p=top_p, tools=tools, tool_choice=tool_choice,
-                               parallel_tool_calls=parallel_tool_calls)
-    if result.status_code != 200:
-        return result
-    chat_json = json.loads(result.get_data())
-    return jsonify(ab.chat_json_to_anthropic(chat_json, model_req))
-
-
 def _chat_direct_lines(messages, model_name, cid, now, rid, t0, temperature=None, max_tokens=None,
                        top_p=None, top_k=None, context_length=None,
                        tools=None, tool_choice=None, parallel_tool_calls=None,
@@ -502,7 +349,7 @@ def _chat_direct_lines(messages, model_name, cid, now, rid, t0, temperature=None
         return {"id": cid, "object": "chat.completion.chunk", "created": now, "model": model_name,
                 "choices": [{"index": 0, "delta": delta, "finish_reason": fr}]}
 
-    salvager = rb.InvokeSalvage() if tools else None
+    salvager = responses.InvokeSalvage() if tools else None
     tc_index = 0
     salvaged_any = False
 
@@ -611,7 +458,7 @@ def _chat_direct_lines(messages, model_name, cid, now, rid, t0, temperature=None
         if salvager is not None:
             for kind, payload in salvager.flush():
                 if kind == "text" and payload:
-                    if rb._INVOKE_START in payload:
+                    if responses._INVOKE_START in payload:
                         logger.warning("[%s] 未闭合 invoke 块降级纯文本（%d 字符）", rid, len(payload))
                     tail = {"id": cid, "object": "chat.completion.chunk", "created": now,
                             "model": model_name,
@@ -724,7 +571,7 @@ def _full_chat_direct(messages, model_name, cid, now, max_tokens, temperature=No
     # 非流式回收：模型把工具调用写成 antml 文本时拆回结构化 tool_calls（排在原有之后）
     if tools and message["content"]:
         try:
-            salv = rb.InvokeSalvage()
+            salv = responses.InvokeSalvage()
             events = salv.feed(message["content"]) + salv.flush()
         except Exception:
             events = [("text", message["content"])]
@@ -756,114 +603,17 @@ def _full_chat_direct(messages, model_name, cid, now, max_tokens, temperature=No
     })
 
 
-# ── 文本补全 (legacy) ─────────────────────────────────────────────────────────
-def _prompt_to_text(prompt):
-    """OpenAI prompt 参数：str 或 str 数组 → 纯文本"""
-    if isinstance(prompt, str):
-        return prompt
-    if isinstance(prompt, list):
-        if not prompt:
-            return ""
-        if all(isinstance(p, str) for p in prompt):
-            return "\n".join(prompt)
-        if all(isinstance(p, int) for p in prompt):
-            return None  # token 数组不支持
-    return None
+# ── 协议路由层挂载（routes/）：每协议一个文件，本文件留引擎与调度 ─────────────
+# register(app, core) 里 core 传本模块：路由经模块属性动态查找引擎与重试决策
+# （_chat_direct_lines / _stream_log / _retry_wait / qoder_cosy 等），测试对
+# server.qoder_cosy 的打桩对路由层同样生效。
+import sys as _sys
 
-
-@app.route("/v1/completions", methods=["POST"])
-def completions():
-    body = request.get_json(silent=True) or {}
-    prompt_in = body.get("prompt", "")
-    model_req = body.get("model", "auto")
-    stream = body.get("stream", False)
-    max_tokens = body.get("max_tokens")
-    temperature = body.get("temperature")
-    cid = f"cmpl-{uuid.uuid4().hex}"
-    now = int(time.time())
-
-    text = _prompt_to_text(prompt_in)
-    if text is None:
-        return jsonify({"error": {"message": "token-array prompt is not supported",
-                                  "type": "invalid_request_error"}}), 400
-    if not text:
-        return jsonify({"error": {"message": "prompt is required",
-                                  "type": "invalid_request_error"}}), 400
-    messages = [{"role": "user", "content": text}]
-    if stream:
-        return _stream_completions_direct(messages, model_req, cid, now, temperature, max_tokens)
-    return _full_completions_direct(messages, model_req, cid, now, temperature, max_tokens)
-
-
-def _stream_completions_direct(messages, model_name, cid, now, temperature=None, max_tokens=None):
-    """COSY 直接 API 流式文本补全：只输出正文，reasoning 不外泄"""
-    # 生成器在请求上下文销毁后才被消费，g 不可用；rid/t0 必须在此取出
-    rid = g.rid
-    t0 = g.t0
-
-    def generate():
-        finish_reason = None
-        errored = False
-
-        def chunk(text, fr=None):
-            return {"id": cid, "object": "text_completion_chunk", "created": now, "model": model_name,
-                    "choices": [{"index": 0, "text": text, "finish_reason": fr}]}
-
-        try:
-            for ev in qoder_cosy.run_qoder_cosy(
-                messages, model=model_name, stream=True, max_tokens=max_tokens,
-                timeout=QODER_TIMEOUT, temperature=temperature,
-            ):
-                etype = ev["type"]
-                if etype == "finish":
-                    finish_reason = ev["reason"]
-                elif etype == "content":
-                    yield f"data: {json.dumps(chunk(ev['text']), ensure_ascii=False)}\n\n"
-        except qoder_cosy.UpstreamError as e:
-            errored = True
-            logger.warning("[%s] direct completions upstream error: %s", rid, e)
-            yield f"data: {json.dumps({'error': {'message': str(e), 'type': 'upstream_error', 'code': e.status}}, ensure_ascii=False)}\n\n"
-        except Exception as e:
-            errored = True
-            logger.exception("[%s] direct completions failure", rid)
-            yield f"data: {json.dumps({'error': {'message': str(e), 'type': 'api_error', 'code': 502}}, ensure_ascii=False)}\n\n"
-        if not errored:
-            yield f"data: {json.dumps(chunk('', finish_reason or 'stop'), ensure_ascii=False)}\n\n"
-        yield "data: [DONE]\n\n"
-
-    return Response(_stream_log(generate(), rid, t0), mimetype="text/event-stream",
-                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-
-
-def _full_completions_direct(messages, model_name, cid, now, temperature=None, max_tokens=None):
-    """COSY 直接 API 非流式文本补全"""
-    parts = []
-    finish_reason = None
-    usage = None
-    try:
-        for ev in qoder_cosy.run_qoder_cosy(
-            messages, model=model_name, stream=True, max_tokens=max_tokens,
-            timeout=QODER_TIMEOUT, temperature=temperature,
-        ):
-            etype = ev["type"]
-            if etype == "content":
-                parts.append(ev["text"])
-            elif etype == "usage":
-                usage = _openai_usage(ev["usage"])
-            elif etype == "finish":
-                finish_reason = ev["reason"]
-    except qoder_cosy.UpstreamError as e:
-        logger.warning("[%s] direct completions upstream error: %s", getattr(g, "rid", "?"), e)
-        return jsonify({"error": {"message": str(e), "type": "upstream_error", "code": e.status}}), e.status
-    except Exception as e:
-        logger.exception("[%s] direct completions failure", getattr(g, "rid", "?"))
-        return jsonify({"error": {"message": str(e), "type": "api_error"}}), 502
-
-    return jsonify({
-        "id": cid, "object": "text_completion", "created": now, "model": model_name,
-        "choices": [{"index": 0, "text": "".join(parts), "finish_reason": finish_reason or "stop"}],
-        "usage": usage or {"prompt_tokens": None, "completion_tokens": None, "total_tokens": None},
-    })
+_core = _sys.modules[__name__]
+chat.register(app, _core)
+routes_responses.register(app, _core)
+messages.register(app, _core)
+completions.register(app, _core)
 
 
 # ── 旁路路由（登录/健康/面板/签到） ───────────────────────────────────────────
