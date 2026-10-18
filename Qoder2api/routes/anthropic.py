@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""routes/messages.py — Anthropic Messages 路由（/v1/messages）。
+"""routes/anthropic.py — Anthropic Messages 路由（/v1/messages）。
 
 与 /v1/responses 同构：adapters/anthropic.py 把 Anthropic ⇄ Chat 翻掉，复用
 qoder_cosy 直连；响应侧包成 Anthropic SSE。

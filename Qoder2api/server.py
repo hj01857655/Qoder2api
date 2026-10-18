@@ -22,7 +22,7 @@ from flask import Flask, Response, g, jsonify, request
 
 from adapters import anthropic, responses
 from lanes import benefit, qoder_cosy
-from routes import chat, completions, messages, responses as routes_responses
+from routes import anthropic, chat, completions, responses as routes_responses
 
 # 兼容别名：旧探针/测试引用的旧模块名（anthropic_bridge / responses_bridge）
 anthropic_bridge = anthropic
@@ -612,7 +612,7 @@ import sys as _sys
 _core = _sys.modules[__name__]
 chat.register(app, _core)
 routes_responses.register(app, _core)
-messages.register(app, _core)
+anthropic.register(app, _core)
 completions.register(app, _core)
 
 
