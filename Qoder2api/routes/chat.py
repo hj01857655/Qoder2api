@@ -21,7 +21,7 @@ def register(app, core):
     def chat_completions():
         body = request.get_json(silent=True) or {}
         messages = body.get("messages", [])
-        model_req = body.get("model", "auto")
+        model_req = body.get("model") or ""
         stream = body.get("stream", False)
         max_tokens = body.get("max_tokens")
         temperature = body.get("temperature")
@@ -39,6 +39,16 @@ def register(app, core):
 
         if not messages:
             return jsonify({"error": {"message": "messages is required", "type": "invalid_request_error"}}), 400
+
+        # 模型门禁放在这里而不是只靠引擎内部：流式一旦开始产出，HTTP 状态码
+        # 就改不了了，只能塞一条 SSE error 事件——客户端拿到的不是 400，
+        # 很多 SDK 会当网络故障重试。在路由层先挡，两种情况都能拿到真 400。
+        try:
+            # 返回值是归一化后的模型名（省略 model 时会给默认限免档）
+            model_req = core.qoder_cosy.ensure_free_model(model_req)
+        except core.qoder_cosy.UpstreamError as e:
+            return jsonify({"error": {"message": getattr(e, "message", str(e)), "type": "invalid_request_error",
+                                      "code": "model_not_allowed"}}), 400
 
         if isinstance(tool_choice, str) and tool_choice not in ("auto", "none", "required"):
             logger.warning("[%s] tool_choice=%r 非 OpenAI 取值，不送上游",

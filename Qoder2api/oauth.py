@@ -23,12 +23,16 @@ import os
 import sys
 import time
 import uuid
+from datetime import datetime
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
 OPENAPI_HOST = "https://openapi.qoder.com.cn"
 WEB_HOST = "https://qoder.cn"
 DEVICE_CLIENT_ID = "e883ade2-e6e3-4d6d-adf7-f92ceff5fdcb"  # Qoder CN CLI 生产 client_id
+# me/jobToken 专用的 clientId —— 与上面的 device flow client_id 是两回事。
+# 用 DEVICE_CLIENT_ID 换恒回 HTTP 400 BadRequest（2026-10-20 实测），用这个值 200。
+JOB_TOKEN_CLIENT_ID = "732aef47-9cf2-46a2-95fe-4cebb5d0d1fa"
 DEVICE_SELECT_ACCOUNTS_PATH = "/device/selectAccounts"
 DEVICE_TOKEN_POLL_PATH = "/api/v1/deviceToken/poll"
 ME_JOB_TOKEN_PATH = "/api/v1/me/jobToken"
@@ -103,20 +107,30 @@ def poll_device_token(nonce: str, verifier: str) -> dict | None:
 
 
 def exchange_job_token(device_token: str) -> tuple[int, dict]:
-    """dt- 设备令牌换 jt- 聊天令牌。CN 的 CLI 从不造 job token，失败时可退回 dt- 直接签名。"""
-    body = json.dumps({"clientId": DEVICE_CLIENT_ID}).encode("utf-8")
+    """dt- 设备令牌换 jt- 聊天令牌。失败时可退回 dt- 直接签名。
+
+    clientId 必须是 JOB_TOKEN_CLIENT_ID：填 DEVICE_CLIENT_ID 会 HTTP 400 BadRequest。"""
+    body = json.dumps({"clientId": JOB_TOKEN_CLIENT_ID}).encode("utf-8")
     return _get_json(f"{OPENAPI_HOST}{ME_JOB_TOKEN_PATH}", bearer=device_token, body=body)
 
 
-def _expires_at(data: dict) -> int:
+def _expires_at(data: dict, in_ms: bool = False) -> int:
+    """in_ms：expires_in 的单位是毫秒。jobToken 族全是毫秒（86400000 = 1 天），
+    deviceToken 族是秒。按秒算毫秒会得到 1000 天 → 永远不续期。
+    不能靠数值大小猜（1 天的毫秒值比 30 天的秒值还大），只能按响应类型指定。"""
     for key in ("expires_at", "expiresAt", "expire_time"):
         v = data.get(key)
         if isinstance(v, (int, float)) and v:
             return int(v / 1000) if v > 1e11 else int(v)
+        if isinstance(v, str) and v:
+            try:
+                return int(datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp())
+            except ValueError:
+                pass
     for key in ("expires_in", "expiresIn"):
         v = data.get(key)
         if isinstance(v, (int, float)) and v > 0:
-            return int(time.time() + v)
+            return int(time.time() + (v / 1000 if in_ms else v))
     return 0
 
 
@@ -165,10 +179,16 @@ def sign_in() -> dict | None:
         cred["token_type"] = "job"
         cred["security_oauth_token"] = jr["token"]
         cred["access_token"] = jr["token"]
-        cred["refresh_token"] = jr.get("refresh_token") or cred["refresh_token"]
-        exp = _expires_at(jr)
+        # **不能覆盖 refresh_token**：drt- 是 30 天/1 年的长效登录态，
+        # 而 jobToken 响应里的 jrt- 只活 2 天。顶掉之后 2 天内就再也刷不回来了。
+        if jr.get("refresh_token"):
+            cred["job_refresh_token"] = jr["refresh_token"]
+        exp = _expires_at(jr, in_ms=True)
         if exp:
             cred["expire_time"] = exp
+        ref_exp = _expires_at(jr, "refresh_token_", in_ms=True)
+        if ref_exp:
+            cred["job_refresh_token_expire_time"] = ref_exp
         print("[login] 已换到 job token", flush=True)
     else:
         print(f"[login] job token 未换到（HTTP {status}），按 device token 签名", flush=True)

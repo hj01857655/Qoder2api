@@ -44,6 +44,21 @@ class UpstreamError(RuntimeError):
         super().__init__(f"HTTP {status}: {message}")
         self.status = status
 
+
+class ModelNotAllowed(UpstreamError):
+    """模型不在限免范围 / 未知模型 —— 本地判定，根本没发上游请求
+
+    单独成类是为了让路由层能把 message 原样给客户端（不带 "HTTP 400:" 前缀），
+    而真正的上游错误仍沿用 UpstreamError 的带前缀格式（日志里那个前缀有用）。
+    """
+
+    def __init__(self, message: str):
+        super().__init__(400, message)
+        self.message = message          # 原文留一份，客户端用这个
+
+    def __str__(self) -> str:
+        return self.message
+
 # ── 端点 ──────────────────────────────────────────────────────────────────────
 GATEWAY_HOST = "https://gateway.qoder.com.cn"
 CHAT_PATH = "/algo/api/v2/service/pro/sse/agent_chat_generation"
@@ -117,6 +132,11 @@ OPENAPI_HOST = "https://openapi.qoder.com.cn"
 WEB_HOST = "https://qoder.cn"
 # Qoder CN CLI 生产环境的 device flow client_id（magpie SITES["qoder-cn"]）
 DEVICE_CLIENT_ID = "e883ade2-e6e3-4d6d-adf7-f92ceff5fdcb"
+# /api/v1/me/jobToken 要的 clientId —— **和上面那个不是一回事，别混用**。
+# 拿 DEVICE_CLIENT_ID 去换一直 HTTP 400 {"errorCode":"BadRequest"}（2026-10-20 实测），
+# 换成这个固定 UUID 立刻 200 换到 jt-。它大概是「推理客户端类型」的注册标识，
+# 语义不明但 23 个独立仓库都照抄同一个值，照抄即可，不要"优化"成随机值或省略。
+JOB_TOKEN_CLIENT_ID = "732aef47-9cf2-46a2-95fe-4cebb5d0d1fa"
 ME_JOB_TOKEN_PATH = "/api/v1/me/jobToken"
 JOB_REFRESH_PATH = "/api/v1/jobToken/refresh"
 DEVICE_POLL_PATH = "/api/v1/deviceToken/poll"
@@ -243,8 +263,13 @@ def _openapi_get(path: str, query: dict, bearer: str = "") -> tuple[int, dict]:
     return _request("GET", path, query=query, bearer=bearer)
 
 
-def _expires_at(data: dict, prefix: str = "") -> int:
-    """expires_at 支持 epoch 秒/毫秒/ISO；缺则用 expires_in 换算；都缺返回 0（未知）"""
+def _expires_at(data: dict, prefix: str = "", in_ms: bool = False) -> int:
+    """expires_at 支持 epoch 秒/毫秒/ISO；缺则用 expires_in 换算；都缺返回 0（未知）
+
+    in_ms：expires_in 的单位是**毫秒**。jobToken 族全是毫秒（实测 86400000 = 1 天、
+    refresh_token_expires_in 172800000 = 2 天），当秒算会得到 1000 天，
+    于是永远不会续期。deviceToken 族是秒——所以这个必须由调用方按响应类型指定，
+    不能靠数值大小猜（1 天毫秒 8.64e7 比 30 天秒 2.59e6 还大）。"""
     for key in (f"{prefix}expires_at", f"{prefix}expiresAt"):
         v = data.get(key)
         if isinstance(v, (int, float)) and v:
@@ -257,12 +282,18 @@ def _expires_at(data: dict, prefix: str = "") -> int:
     for key in (f"{prefix}expires_in", f"{prefix}expiresIn"):
         v = data.get(key)
         if isinstance(v, (int, float)) and v > 0:
-            return int(time.time() + v)
+            return int(time.time() + (v / 1000 if in_ms else v))
     return 0
 
 
 def _cred_applied(data: dict, base: dict, token_type: str) -> dict | None:
-    """把兑换/续期响应并进凭证；无 token 视为失败。refresh_token 会轮换，必须整体覆盖"""
+    """把兑换/续期响应并进凭证；无 token 视为失败。refresh_token 会轮换，必须整体覆盖
+
+    token_type="job" 时走 jobToken 分支：单位是毫秒，且 **不能覆盖 refresh_token**。
+    原因：文件里那个 `drt-` 是 30 天/1 年的长效登录态，而 jobToken 响应带的
+    `jrt-` 只活 2 天。直接覆盖会让 2 天后连用户都刷不回来（要重新走浏览器授权）。
+    所以把 job 族的刷新凭据单独存在 `job_refresh_token`，与长效的分开。"""
+    job = token_type == "job"
     tok = data.get("token") or data.get("device_token") or data.get("access_token") or ""
     if not tok:
         return None
@@ -270,12 +301,18 @@ def _cred_applied(data: dict, base: dict, token_type: str) -> dict | None:
     cred["security_oauth_token"] = tok
     cred["access_token"] = tok
     cred["token_type"] = token_type
-    if _expires_at(data):
-        cred["expire_time"] = _expires_at(data)
-    if _expires_at(data, "refresh_token_"):
-        cred["refresh_token_expire_time"] = _expires_at(data, "refresh_token_")
+    exp = _expires_at(data, in_ms=job)
+    if exp:
+        cred["expire_time"] = exp
+    ref_exp = _expires_at(data, "refresh_token_", in_ms=job)
+    if ref_exp:
+        cred["refresh_token_expire_time" if not job else "job_refresh_token_expire_time"] = ref_exp
     if data.get("refresh_token"):
-        cred["refresh_token"] = data["refresh_token"]
+        if job:
+            # 别动凭长效登录态的 refresh_token
+            cred["job_refresh_token"] = data["refresh_token"]
+        else:
+            cred["refresh_token"] = data["refresh_token"]
     for key in ("uid", "name", "email"):
         if data.get(key):
             cred[key] = data[key]
@@ -310,8 +347,10 @@ def _device_flow_sign_in(state: dict | None = None) -> dict | None:
         if not cred.get("uid"):
             cred["uid"] = str(ui.get("id") or ui.get("user_id") or ui.get("uid") or "")
 
-    # CN 的 CLI 从不造 job token，device token 本身就是签名用聊天 token（magpie deviceChat）
-    status, jr = _openapi_post(ME_JOB_TOKEN_PATH, {"clientId": DEVICE_CLIENT_ID}, bearer=dt["token"])
+    # 换 job token。**clientId 必须是 JOB_TOKEN_CLIENT_ID**：拿 device flow 的
+    # client_id 去换恒回 HTTP 400 BadRequest（2026-10-20 实测），换对了立刻 200。
+    # 换不到也无妨——device token 同样能签名，只是少了那层短期凭据。
+    status, jr = _openapi_post(ME_JOB_TOKEN_PATH, {"clientId": JOB_TOKEN_CLIENT_ID}, bearer=dt["token"])
     job = _cred_applied(jr, cred, "job") if status == 200 else None
     if job:
         return job
@@ -326,25 +365,49 @@ def _bootstrap() -> dict | None:
 
 
 def _refresh_credential(cred: dict) -> dict | None:
-    """一次性 refresh_token 换整对（响应里的新 refresh_token 必须覆盖旧值）"""
-    rt = cred.get("refresh_token") or ""
-    if not rt:
-        return None
-    order = ([DEVICE_REFRESH_PATH, JOB_REFRESH_PATH] if cred.get("token_type") == "device"
-             else [JOB_REFRESH_PATH, DEVICE_REFRESH_PATH])
-    for path in order:
+    """续期。两套凭据各有各的刷新口，**不能互相顶替**：
+
+      deviceToken/refresh  ← drt-（rotation，长效 30 天/1 年）
+      jobToken/refresh     ← jrt-（rotation，只活 2 天）
+
+    用 drt- 去打 jobToken/refresh 必然 400（那是另一种 refresh token），
+    反过来同理。所以先按当前 token_type 走自己的口，都失败再退回长效的
+    device 续期 + 重新换一次 job token。"""
+    # 1) 先刷当前这套。job 用 jrt-，device 用 drt-。
+    tries = []
+    if cred.get("token_type") == "job" and cred.get("job_refresh_token"):
+        tries.append((JOB_REFRESH_PATH, "job", cred["job_refresh_token"]))
+    if cred.get("refresh_token"):
+        tries.append((DEVICE_REFRESH_PATH, "device", cred["refresh_token"]))
+    for path, ttype, rt in tries:
         status, data = _openapi_post(path, {"refresh_token": rt})
         if status != 200:
             print(f"[qoder_cosy] 续期 {path} → HTTP {status}", flush=True)
             continue
-        new = _cred_applied(data, cred, "device" if path == DEVICE_REFRESH_PATH else "job")
+        new = _cred_applied(data, cred, ttype)
         if not new:
             print(f"[qoder_cosy] 续期 {path} 响应无 token", flush=True)
             continue
         print(f"[qoder_cosy] 凭证已续期（{path}）", flush=True)
+        if ttype == "device" and new.get("token_type") != "job":
+            # device token 刷成功了，但签名用的是 job——顺手再换一个，换不到就用 dt-。
+            new = _renew_job_from_device(new)
         _save_cred(new)
         return new
     return None
+
+
+def _renew_job_from_device(cred: dict) -> dict:
+    """拿刚续好的 device token 换一个新 job token；失败原样返回（dt- 也能签名）"""
+    dt = cred.get("access_token") or ""
+    if not dt.startswith("dt-"):
+        return cred
+    status, jr = _openapi_post(ME_JOB_TOKEN_PATH, {"clientId": JOB_TOKEN_CLIENT_ID}, bearer=dt)
+    job = _cred_applied(jr, cred, "job") if status == 200 else None
+    if job:
+        print("[qoder_cosy] 已用 device token 重新换到 job token", flush=True)
+        return job
+    return cred
 
 
 def _expiring(cred: dict) -> bool:
@@ -488,7 +551,17 @@ _model_cache = None
 _model_cache_time = 0
 MODEL_CACHE_TTL = 300  # 5 分钟
 
-# 内置模型列表（无法从 API 获取时兜底）
+# 内置模型列表（无法从 API 获取时兜底）——**只放限免的那两个**
+#
+# 2026-10-20 按 /algo/api/v2/model/list 的 price_factor 核过：只有
+# Qwen3.8-Flash 和 DeepSeek-Flash 是 0.0（原价 0.1），其余 11 个都计费。
+# 这里**故意只留这两个**：兜底名单一旦包含收费模型，网络抖动时就会静默把
+# 付费档推给客户端，而且错的方向最坏（用户以为免费，实际扣额度）。
+# 宁可漏推荐，不可错推荐。
+#
+# 注意：这是写死的快照，上游改了收费策略它不会跟着变。它是「拉不到列表时
+# 不得不给点什么」的最后手段，不是事实来源——真相永远在 model/list 的
+# price_factor 里。
 FALLBACK_MODELS = [
     "Qwen3.8-Flash", "DeepSeek-Flash",
 ]
@@ -548,28 +621,152 @@ def fetch_models() -> list[dict]:
     return models
 
 
+def _price_factor(m: dict) -> float | None:
+    """取模型倍率（price_factor）；取不到返回 None
+
+    实测当前全是 JSON number（0.0 / 0.1 / …），但上游换类型不是没可能——
+    字符串 "0.0" 用 `== 0` 比是 False，会把免费模型误判成收费。统一转 float。
+    """
+    cfg = m.get("config") or {}
+    v = cfg.get("price_factor")
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
 def _is_free_model(m: dict) -> bool:
-    """模型是否限免：price_factor 为 0（浮点 0.0）或 is_free 为 true
+    """模型是否限免：price_factor 为 0 或 is_free 为 true
 
     2026-10-20 从 /algo/api/v2/model/list 原始配置核出：Qwen3.8-Flash 与
-    DeepSeek-Flash 两个满足，其余 11 个均按 price_factor 计费。
+    DeepSeek-Flash 两个满足（price_factor=0.0 + is_free=true，原价 0.1），
+    其余 11 个均按 price_factor 计费。
     """
-    cfg = m.get("config", {})
-    return bool(cfg.get("is_free")) or cfg.get("price_factor") == 0
+    cfg = m.get("config") or {}
+    if cfg.get("is_free"):
+        return True
+    pf = _price_factor(m)
+    return pf is not None and pf == 0.0
+
+
+def model_entry(m: dict) -> dict:
+    """给 /v1/models 用的一条记录：在标准字段外附带倍率信息
+
+    OpenAI 客户端会忽略不认识的字段，所以多这两个不破坏兼容性；
+    但人和面板就能看出「为什么列表里只有这些」，而不是面对一个空名单干瞪眼。
+    """
+    cfg = m.get("config") or {}
+    return {
+        "key": m["key"],
+        "name": m["name"],
+        "price_factor": _price_factor(m),
+        "is_free": _is_free_model(m),
+        "original_price_factor": cfg.get("original_price_factor"),
+        "context_window": cfg.get("max_input_tokens") or 0,
+        "supports_vision": bool(cfg.get("is_vl")),
+        "is_reasoning": bool(cfg.get("is_reasoning")),
+    }
+
+
+def list_model_entries() -> list[dict]:
+    """限免模型的完整信息（含倍率）；取不到上游列表时回落 FALLBACK_MODELS"""
+    models = fetch_models()
+    if models:
+        free = [model_entry(m) for m in models if _is_free_model(m)]
+        if free:
+            return free
+    return [{"key": n, "name": n, "price_factor": 0.0, "is_free": True,
+             "original_price_factor": None, "context_window": 0,
+             "supports_vision": False, "is_reasoning": False}
+            for n in FALLBACK_MODELS]
 
 
 def list_model_ids() -> list[str]:
     """返回模型 ID 列表（用显示名，客户端友好）——只输出限免模型
 
-    注意：这里只过滤「输出面」。find_model_config() 仍解析全部模型，
-    客户端显式请求付费模型时照样放行（调用方自己把握额度）。
+    列表里没有的模型，请求时也会被 ensure_free_model() 挡掉（见下）。
+    两处一致，不会出现「列表里没有但能调」的落差。
+    """
+    return [e["name"] for e in list_model_entries()]
+
+
+def resolve_model(model_key: str) -> dict | None:
+    """按 key / display_name / 模糊 找到模型条目（含 price_factor 等元数据）
+
+    与 find_model_config 的区别：后者只回 config（构建请求体要用），本函数回整条
+    `{"key","name","config",...}`，因为判断收费与否要同时看 config 里的
+    price_factor/is_free 和条目本身的 key/name。
     """
     models = fetch_models()
-    if models:
-        free = [m["name"] for m in models if _is_free_model(m)]
-        if free:
-            return free
-    return list(FALLBACK_MODELS)
+    lk = (model_key or "").strip().lower()
+    if not lk:
+        return None
+    for m in models:                       # 精确 key
+        if m["key"] == model_key:
+            return m
+    for m in models:                       # 精确显示名
+        if m["name"] == model_key:
+            return m
+    for m in models:                       # 模糊（兼容客户端的大小写/别名）
+        if lk in m["name"].lower() or lk in m["key"].lower():
+            return m
+    return None
+
+
+def default_model_name() -> str:
+    """客户端没填 model 时用的档：取限免名单第一个（当前是 Qwen3.8-Flash）
+
+    不能给空串——上游 X-Model-Key 必填。也不给 "auto"——上游没有这个模型
+    （实测 13 个 key 里没有 auto），填了只会返一个上游错误。
+    """
+    ids = list_model_ids()
+    return ids[0] if ids else (FALLBACK_MODELS[0] if FALLBACK_MODELS else "")
+
+
+def ensure_free_model(model_key: str) -> str:
+    """校验模型是否限免，**返回实际要用的模型名**（空值会归一成默认档）
+
+    为什么不放行付费档：`/v1/models` 只列限免的两个模型，客户端却可以硬编码
+    一个付费模型照样调通——那等于把「免费」做成了看用户自觉。付费档会按
+    price_factor 真扣额度（Kimi-K3 是 1.4 倍），而用户从列表上看不出来。
+
+    三种情况一律拒绝，且**故意把原因写清楚**（哪个档、多少倍率、该用哪个）：
+      1. 明确收费（price_factor > 0）
+      2. 上游列表里根本没有（名字拼错 / 已下线）—— 不猜，直接报
+      3. 拉不到列表（fetch_models 空）—— 只认 FALLBACK_MODELS
+
+    第 3 种别理解成「暂时拿不到元数据就网开一面」：宁可拒绝也不要冒险放行
+    一个可能收费的档。
+
+    为什么返回名字而不是 None：调用方（四个路由 + 引擎）都需要处理「省略
+    model」的情况。把归一化放在这里，调用方拿返回值直接用，不用各自复制
+    一遍 `if not model.strip(): model = default_model_name()`。
+    """
+    # 空 model 不算错：OpenAI 协议里它是可选字段，很多客户端干脆不填。
+    # 上游没有 "auto" 这个模型（13 个 key 里没有），空串更是必挂，
+    # 所以统一落到默认限免档。
+    if not (model_key or "").strip():
+        return default_model_name()
+
+    models = fetch_models()
+    if not models:
+        if model_key in FALLBACK_MODELS:
+            return model_key
+        raise ModelNotAllowed(
+            f"模型 {model_key!r} 不可用（上游模型列表暂时取不到，仅允许 "
+            f"{', '.join(FALLBACK_MODELS)}）")
+
+    entry = resolve_model(model_key)
+    if entry is None:
+        avail = ", ".join(m["name"] for m in models if _is_free_model(m)) or "无"
+        raise ModelNotAllowed(f"未知模型 {model_key!r}。当前可用（限免）：{avail}")
+    if not _is_free_model(entry):
+        pf = _price_factor(entry)
+        avail = ", ".join(m["name"] for m in models if _is_free_model(m)) or "无"
+        raise ModelNotAllowed(
+            f"模型 {entry['name']!r} 不在限免范围（price_factor={pf}），"
+            f"已拒绝以免扣额度。请改用：{avail}")
+    return entry["name"]
 
 
 def find_model_config(model_key: str) -> dict | None:
@@ -922,6 +1119,11 @@ def run_qoder_cosy(
 
     上游 SSE 每行 data: 是 JSON 信封，body 字段是 OpenAI chunk。
     """
+    # 非限免模型直接拒（付费档会真扣额度，列表里又看不到，不能凭自觉）。
+    # 顺带把空 model 归一成默认限免档——上游没有 "auto"，空串更是必挂。
+    # 路由层已经挡过一遍，这里是纵深防御：引擎也可能被测试/脚本直接调用。
+    model = ensure_free_model(model)
+
     # 获取模型配置
     model_config = find_model_config(model)
 

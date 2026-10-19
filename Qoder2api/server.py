@@ -246,19 +246,48 @@ def _method_not_allowed(e):
 # ── 模型列表 ──────────────────────────────────────────────────────────────────
 @app.route("/v1/models", methods=["GET"])
 def models():
+    """限免模型列表，附带倍率信息
+
+    标准字段（id/object/created/owned_by）之外多给 price_factor / is_free 等。
+    OpenAI 客户端会忽略不认识的字段，不破坏兼容性；但这些字段能回答
+    「为什么列表里只有这两个」——否则用户只看到一个空荡荡的名单。
+    """
     now = int(time.time())
-    data = [{"id": mid, "object": "model", "created": now, "owned_by": "qoder"}
-            for mid in qoder_cosy.list_model_ids()]
+    data = []
+    for e in qoder_cosy.list_model_entries():
+        item = {"id": e["name"], "object": "model", "created": now, "owned_by": "qoder",
+                "price_factor": e["price_factor"], "is_free": e["is_free"]}
+        if e.get("original_price_factor") is not None:
+            item["original_price_factor"] = e["original_price_factor"]
+        if e.get("context_window"):
+            item["context_window"] = e["context_window"]
+        item["supports_vision"] = e.get("supports_vision", False)
+        data.append(item)
     return jsonify({"object": "list", "data": data})
 
 
 # ── usage 映射 ────────────────────────────────────────────────────────────────
 def _openai_usage(u: dict) -> dict:
-    """Qoder usage → OpenAI usage"""
+    """Qoder usage → OpenAI usage
+
+    上游按模型给不给计数：实测 DeepSeek-Flash **压根不发 usage 事件**（同一轮的
+    Qwen3.8-Flash 正常发）。所以这里除了防御上游真给 null，还要配合调用方的
+    兜底——两处都给 0，不能给 None。
+    为什么必须给 0：很多 SDK 拿这个字段直接做算术（累计成本、算 TPS），
+    `null + 1` 就是 TypeError。字段本身要**保留**（删掉反而会让 `.tokens`
+    访问抛 AttributeError）。与 adapters/anthropic.py 的 `int(... or 0)` 一致。
+    """
+    def _n(key):
+        v = u.get(key)
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return 0
+
     out = {
-        "prompt_tokens": u.get("prompt_tokens"),
-        "completion_tokens": u.get("completion_tokens"),
-        "total_tokens": u.get("total_tokens"),
+        "prompt_tokens": _n("prompt_tokens"),
+        "completion_tokens": _n("completion_tokens"),
+        "total_tokens": _n("total_tokens"),
     }
     cd = u.get("completion_tokens_details")
     if cd:
@@ -471,8 +500,12 @@ def _chat_direct_lines(messages, model_name, cid, now, rid, t0, temperature=None
                 "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason or "stop"}]}
         yield f"data: {json.dumps(done, ensure_ascii=False)}\n\n"
         if include_usage:
+            # 上游对部分模型（如 DeepSeek-Flash）压根不发 usage 事件。这里不能发空
+            # 对象——客户端读 usage.total_tokens 会 AttributeError；统一给 0。
             usage_chunk = {"id": cid, "object": "chat.completion.chunk", "created": now,
-                           "model": model_name, "choices": [], "usage": usage or {}}
+                           "model": model_name, "choices": [],
+                           "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0,
+                                              "total_tokens": 0}}
             yield f"data: {json.dumps(usage_chunk, ensure_ascii=False)}\n\n"
     yield "data: [DONE]\n\n"
 
@@ -599,7 +632,8 @@ def _full_chat_direct(messages, model_name, cid, now, max_tokens, temperature=No
     return jsonify({
         "id": cid, "object": "chat.completion", "created": now, "model": model_name,
         "choices": [{"index": 0, "message": message, "finish_reason": finish_reason or "stop"}],
-        "usage": usage or {"prompt_tokens": None, "completion_tokens": None, "total_tokens": None},
+        # 拿不到 usage 时给 0 而不是 None：客户端会拿它做算术，null + 1 直接 TypeError。
+        "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
     })
 
 

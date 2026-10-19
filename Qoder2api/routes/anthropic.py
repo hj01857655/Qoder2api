@@ -32,7 +32,7 @@ def register(app, core):
             return jsonify(ab.error_body("invalid_request_error",
                 "invalid request: 'messages' is required")), 400
 
-        model_req = body.get("model", "auto")
+        model_req = body.get("model") or ""
         stream = bool(body.get("stream"))
         max_tokens = chat_body.get("max_tokens")
         temperature = chat_body.get("temperature")
@@ -43,6 +43,17 @@ def register(app, core):
         cid = "chatcmpl-" + uuid.uuid4().hex
         now = int(time.time())
         rid, t0 = g.rid, g.t0
+
+        # 模型门禁前置：流式一旦开始产出就改不了 HTTP 状态码了，只能塞 SSE error。
+        # 在这里挡，客户端才能拿到真正的 400（SDK 才会正确归类为请求错误）。
+        # 必须用 ab.error_body()：Anthropic 的错误体是 {"type":"error","error":{...}}，
+        # 直接给 {"error":{...}} 会让 Anthropic SDK 解析失败（它按 type 字段判形）。
+        try:
+            # 返回值是归一化后的模型名（省略 model 时会给默认限免档）
+            model_req = core.qoder_cosy.ensure_free_model(model_req)
+        except core.qoder_cosy.UpstreamError as e:
+            return jsonify(ab.error_body("invalid_request_error",
+                                         getattr(e, "message", str(e)))), 400
 
         if stream:
             lines = _chat_direct_lines(messages, model_req, cid, now, rid, t0,

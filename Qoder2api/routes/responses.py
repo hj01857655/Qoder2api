@@ -33,7 +33,13 @@ def register(app, core):
             return jsonify({"error": {"message": "invalid request: 'input' is required",
                                       "type": "invalid_request_error"}}), 400
 
-        model_req = body.get("model", "auto")
+        model_req = body.get("model") or ""
+        # 模型门禁前置：流式一旦开始产出就改不了 HTTP 状态码，只能塞 SSE error。
+        try:
+            # 返回值是归一化后的模型名（省略 model 时会给默认限免档）
+            model_req = core.qoder_cosy.ensure_free_model(model_req)
+        except core.qoder_cosy.UpstreamError as e:
+            return jsonify({"error": {"type": "invalid_request_error", "message": getattr(e, "message", str(e))}}), 400
         stream = bool(body.get("stream"))
         max_tokens = chat_body.get("max_tokens")
         temperature = chat_body.get("temperature")

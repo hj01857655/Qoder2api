@@ -36,12 +36,19 @@ def register(app, core):
     def completions():
         body = request.get_json(silent=True) or {}
         prompt_in = body.get("prompt", "")
-        model_req = body.get("model", "auto")
+        model_req = body.get("model") or ""
         stream = body.get("stream", False)
         max_tokens = body.get("max_tokens")
         temperature = body.get("temperature")
         cid = f"cmpl-{uuid.uuid4().hex}"
         now = int(time.time())
+
+        # 模型门禁前置：流式一旦开始产出就改不了 HTTP 状态码，只能塞 SSE error。
+        try:
+            # 返回值是归一化后的模型名（省略 model 时会给默认限免档）
+            model_req = core.qoder_cosy.ensure_free_model(model_req)
+        except core.qoder_cosy.UpstreamError as e:
+            return jsonify({"error": {"type": "invalid_request_error", "message": getattr(e, "message", str(e))}}), 400
 
         text = _prompt_to_text(prompt_in)
         if text is None:
@@ -121,5 +128,6 @@ def register(app, core):
         return jsonify({
             "id": cid, "object": "text_completion", "created": now, "model": model_name,
             "choices": [{"index": 0, "text": "".join(parts), "finish_reason": finish_reason or "stop"}],
-            "usage": usage or {"prompt_tokens": None, "completion_tokens": None, "total_tokens": None},
+            # 拿不到 usage 时给 0 而不是 None：客户端会拿它做算术，null + 1 直接 TypeError。
+            "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         })
