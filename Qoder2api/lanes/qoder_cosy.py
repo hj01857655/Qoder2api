@@ -490,9 +490,7 @@ MODEL_CACHE_TTL = 300  # 5 分钟
 
 # 内置模型列表（无法从 API 获取时兜底）
 FALLBACK_MODELS = [
-    "Auto", "Qwen3.8-Max", "Qwen3.8-Flash", "Qwen3.7-Max", "Qwen3.7-Plus",
-    "Qwen3.7-Flash", "DeepSeek-V4-Pro", "DeepSeek-V4-Flash", "GLM-5.3",
-    "GLM-5.3-Flash", "GLM-5.2", "Kimi-K3", "Kimi-K2.8-Preview", "MiniMax-M2.7",
+    "Qwen3.8-Flash", "DeepSeek-Flash",
 ]
 
 
@@ -550,11 +548,27 @@ def fetch_models() -> list[dict]:
     return models
 
 
+def _is_free_model(m: dict) -> bool:
+    """模型是否限免：price_factor 为 0（浮点 0.0）或 is_free 为 true
+
+    2026-10-20 从 /algo/api/v2/model/list 原始配置核出：Qwen3.8-Flash 与
+    DeepSeek-Flash 两个满足，其余 11 个均按 price_factor 计费。
+    """
+    cfg = m.get("config", {})
+    return bool(cfg.get("is_free")) or cfg.get("price_factor") == 0
+
+
 def list_model_ids() -> list[str]:
-    """返回模型 ID 列表（用显示名，客户端友好）"""
+    """返回模型 ID 列表（用显示名，客户端友好）——只输出限免模型
+
+    注意：这里只过滤「输出面」。find_model_config() 仍解析全部模型，
+    客户端显式请求付费模型时照样放行（调用方自己把握额度）。
+    """
     models = fetch_models()
     if models:
-        return [m["name"] for m in models]
+        free = [m["name"] for m in models if _is_free_model(m)]
+        if free:
+            return free
     return list(FALLBACK_MODELS)
 
 
