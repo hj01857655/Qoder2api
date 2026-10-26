@@ -15,6 +15,8 @@ go build -o qoder2api .
 | 环境变量 | 说明 |
 |---|---|
 | `API_KEY` | 客户端鉴权密钥 |
+| `HOST` | 监听地址，默认 `127.0.0.1`（Docker 部署设为 `0.0.0.0`） |
+| `PORT` | 监听端口，默认 `8388` |
 | `QODER_OPENAPI_HOST` | OpenAPI 上游地址覆盖 |
 | `QODER_GATEWAY_HOST` | 网关上游地址覆盖 |
 | `QODER_WEB_HOST` | Web 上游地址覆盖 |

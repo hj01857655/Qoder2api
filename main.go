@@ -71,7 +71,7 @@ func serve(cfg *config.Config, q *qoder.Client, log *slog.Logger) {
 		Log:  log,
 	}
 
-	fmt.Printf("Qoder2api (Go) listening on %s:%d\n", config.ListenHost, cfg.Port)
+	fmt.Printf("Qoder2api (Go) listening on %s:%d\n", cfg.Host, cfg.Port)
 	fmt.Printf("  state dir : %s\n", cfg.StateDir)
 	fmt.Printf("  api key   : %s\n", map[bool]string{true: "enabled", false: "disabled"}[cfg.APIKey != ""])
 	fmt.Printf("  persist   : %v\n", cfg.PersistCred)
@@ -80,7 +80,7 @@ func serve(cfg *config.Config, q *qoder.Client, log *slog.Logger) {
 	// 不阻塞 HTTP 服务本身。
 	go benefit(q, cfg, log).StartDailyLoop()
 
-	addr := fmt.Sprintf("%s:%d", config.ListenHost, cfg.Port)
+	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 	if err := http.ListenAndServe(addr, s.Handler()); err != nil {
 		fmt.Fprintln(os.Stderr, "server exit:", err)
 		os.Exit(1)

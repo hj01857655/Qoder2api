@@ -15,11 +15,14 @@ import (
 )
 
 const (
-	ListenHost  = "0.0.0.0"
+	// ListenHost 是默认绑定地址：仅本机回环，避免未鉴权时暴露到局域网；
+	// 需要对外（如 Docker 容器内）用 HOST 环境变量覆盖为 0.0.0.0。
+	ListenHost  = "127.0.0.1"
 	DefaultPort = 8388
 )
 
 type Config struct {
+	Host         string
 	APIKey       string
 	Port         int
 	StateDir     string // credentials.json / request.log / dumps/ / .coffee_claimed 所在
@@ -37,6 +40,7 @@ func (c *Config) StateFilePath(name string) string { return filepath.Join(c.Stat
 // .env 从状态目录和工作目录两处尝试（与 python-dotenv 的 load_dotenv 语义近似）。
 func Load() *Config {
 	c := &Config{
+		Host:         ListenHost,
 		Port:         DefaultPort,
 		Timeout:      120,
 		PersistCred:  true,
@@ -61,6 +65,9 @@ func Load() *Config {
 	}
 
 	c.APIKey = strings.TrimSpace(os.Getenv("API_KEY"))
+	if h := strings.TrimSpace(os.Getenv("HOST")); h != "" {
+		c.Host = h
+	}
 	if p, err := strconv.Atoi(strings.TrimSpace(os.Getenv("PORT"))); err == nil && p > 0 {
 		c.Port = p
 	}

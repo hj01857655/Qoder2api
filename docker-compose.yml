@@ -7,6 +7,7 @@ services:
       - "8388:8388"
     environment:
       - API_KEY=${API_KEY}
+      - HOST=${HOST:-0.0.0.0}
       - PORT=${PORT:-8388}
       - QODER_OPENAPI_HOST=${QODER_OPENAPI_HOST}
       - QODER_GATEWAY_HOST=${QODER_GATEWAY_HOST}
