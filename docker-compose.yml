@@ -1,0 +1,21 @@
+services:
+  qoder2api:
+    build: .
+    container_name: qoder2api
+    restart: unless-stopped
+    ports:
+      - "8388:8388"
+    environment:
+      - API_KEY=${API_KEY}
+      - PORT=${PORT:-8388}
+      - QODER_OPENAPI_HOST=${QODER_OPENAPI_HOST}
+      - QODER_GATEWAY_HOST=${QODER_GATEWAY_HOST}
+      - QODER_WEB_HOST=${QODER_WEB_HOST}
+    volumes:
+      - ./data:/app/data
+    networks:
+      - qoder2api_net
+
+networks:
+  qoder2api_net:
+    driver: bridge
