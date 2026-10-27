@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Qoder2api</title>
+<style>
+:root{--bg:#0f1115;--card:#181b22;--line:#262b36;--tx:#e6e9ef;--dim:#8b93a3;--ok:#4ade80;--bad:#f87171;--warn:#fbbf24;--acc:#6ea8fe}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.6 "Segoe UI",system-ui,sans-serif}
+.wrap{max-width:980px;margin:0 auto;padding:20px 16px 60px}
+h1{font-size:18px;margin:0 0 4px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px;margin-bottom:14px}
+.card h3{margin:0 0 10px;font-size:14px}
+.kv{display:grid;grid-template-columns:110px 1fr;gap:4px 12px;font-size:13px}
+.kv b{color:var(--dim);font-weight:400}
+button{background:var(--acc);border:none;border-radius:6px;color:#0b1220;padding:7px 14px;cursor:pointer;font-size:13px;font-weight:600}
+button.ghost{background:none;border:1px solid var(--line);color:var(--tx);font-weight:400}
+button:disabled{opacity:.45;cursor:default}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line)}
+th{color:var(--dim);font-weight:400}
+.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}.dim{color:var(--dim)}
+.badge{display:inline-block;border-radius:99px;padding:1px 9px;font-size:11px;font-weight:600}
+.badge.on{background:#14321f;color:var(--ok)}.badge.off{background:#321414;color:var(--bad)}
+.mono{font-family:Consolas,monospace;font-size:12px}
+#msg{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#1f2430;border:1px solid var(--line);border-radius:8px;padding:10px 18px;font-size:13px;display:none;max-width:80vw}
+input{background:#0d0f13;border:1px solid var(--line);border-radius:6px;color:var(--tx);padding:7px 10px;font-size:13px;width:180px}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>Qoder2api 控制台</h1>
+<div id="vMain"></div>
+</div>
+<div id="msg"></div>
+<script>
+"use strict";
+const $=s=>document.querySelector(s);
+function authHeaders(){const k=localStorage.qoder2api_apikey;if(!k)return{};return{"Authorization":"Bearer "+k}}
+const api=p=>fetch(p,{headers:authHeaders()}).then(r=>r.json().then(j=>({status:r.status,body:j}))).catch(e=>({status:0,body:{message:String(e)}}));
+let tt;function toast(t,bad){const m=$("#msg");m.textContent=t;m.style.display="block";m.style.color=bad?"var(--bad)":"var(--tx)";clearTimeout(tt);tt=setTimeout(()=>m.style.display="none",3500)}
+function esc(s){const d=document.createElement("div");d.textContent=s==null?"":String(s);return d.innerHTML}
+
+async function load(){
+  const r=await api("/admin/api/overview");
+  if(r.status!==200||!r.body.credential){
+    $("#vMain").innerHTML=`<div class="card"><h3>overview 加载失败</h3>
+    <div class="kv">${r.status===401?`<b>鉴权</b><span>服务开启了 API_KEY，在下方填入后重试</span>`:""}</div>
+    <div style="margin-top:10px"><input id="k" placeholder="API Key" value="${esc(localStorage.qoder2api_apikey||"")}">
+    <button onclick="localStorage.qoder2api_apikey=document.getElementById('k').value;toast('已保存');load()">保存并重试</button></div></div>`;
+    return;
+  }
+  const o=r.body,c=o.credential;
+  $("#vMain").innerHTML=`
+  <div class="card"><h3>凭据</h3><div class="kv">
+    <b>状态</b><span class="${c.valid?"ok":"bad"}">${c.valid?"有效":"无效"}${c.notice?" — "+esc(c.notice):""}</span>
+    <b>账号</b><span>${esc(c.email||c.name||"—")} <span class="dim mono">${esc(c.uid||"")}</span></span>
+    <b>token 类型</b><span>${esc(c.token_type||"—")}</span>
+    <b>有效期</b><span>${esc(c.expire_text||"—")}</span>
+    <b>本地鉴权</b><span>${o.local_auth?`<span class="badge on">API_KEY 已开启</span> <input id="k" placeholder="API Key" value="${esc(localStorage.qoder2api_apikey||"")}"> <button class="ghost" onclick="localStorage.qoder2api_apikey=document.getElementById('k').value;toast('已保存')">保存</button>`:'<span class="badge off">未开启（仅回环）</span>'}</span>
+  </div></div>
+  <div class="card"><h3>限免模型</h3>
+    <table><tr><th>模型</th><th>倍率</th><th>上下文</th><th>能力</th></tr>
+    ${(o.models||[]).map(m=>`<tr><td>${esc(m.name||m.key)}<div class="dim mono" style="font-size:11px">${esc(m.key)}</div></td>
+    <td>${m.is_free?'<span class="ok">限免</span>':esc(m.price_factor??"—")}</td>
+    <td class="dim">${m.context_window?esc(m.context_window):"—"}</td>
+    <td>${m.supports_vision?'<span class="badge on">视觉</span> ':""}${m.is_reasoning?'<span class="badge on">推理</span>':""}</td></tr>`).join("")}</table></div>
+  <div class="card"><h3>登录</h3>
+    <button onclick="doLogin(this)">重新登录（device flow）</button>
+    <span class="dim">授权链接会打印在服务日志里，15 分钟内有效</span>
+    <div id="lgOut" style="margin-top:10px"></div></div>`;
+}
+async function doLogin(btn){
+  btn.disabled=true;
+  const r=await api("/login");
+  if(r.status!==200){toast("登录请求失败：HTTP "+r.status,true);btn.disabled=false;return}
+  const out=$("#lgOut");
+  const deadline=Date.now()+15*60*1000;
+  const poll=async()=>{
+    const s=await api("/login/status");
+    const b=s.body||{};
+    out.innerHTML=`<span class="${b.status==="ok"?"ok":b.status==="failed"?"bad":"dim"}">${esc(b.email||b.status||"")}${b.error?" — "+esc(b.error):""}</span>`;
+    if(b.status==="ok"){toast("登录成功："+(b.email||""));btn.disabled=false;load();return}
+    if(b.status==="failed"||Date.now()>deadline){btn.disabled=false;return}
+    setTimeout(poll,2000);
+  };
+  poll();
+}
+load();
+</script>
+</body>
+</html>

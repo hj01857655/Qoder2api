@@ -574,6 +574,18 @@ func (c *Client) LoadIdentity(forceRefresh bool) (*Credentials, error) {
 	return cred, nil
 }
 
+// PeekCredential 当前凭据快照（内存缓存 > credentials.json），只读展示用：
+// 绝不触发 device flow 登录或续期——面板打开不应产生登录副作用。无凭据返回 nil。
+func (c *Client) PeekCredential() *Credentials {
+	c.mu.Lock()
+	cached := c.cached
+	c.mu.Unlock()
+	if cached != nil {
+		return cached
+	}
+	return c.loadCredFile()
+}
+
 // MachineID 当前身份的 machine_id（LoadIdentity 时缓存）。
 func (c *Client) MachineID(cred *Credentials) string {
 	return firstNonEmpty(cred.MachineID, c.ProcessMachineID())

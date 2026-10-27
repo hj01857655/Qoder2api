@@ -493,6 +493,54 @@ func TestAuthRequired(t *testing.T) {
 	}
 }
 
+func TestAdminOverviewAndPanel(t *testing.T) {
+	srv, _ := newTestServer(t, "stream", "")
+	h := srv.Handler()
+
+	// 概览：凭据来自测试装配写好的 credentials.json；模型列表与 /v1/models 同源
+	req := httptest.NewRequest(http.MethodGet, "/admin/api/overview", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var out map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &out)
+	c := out["credential"].(map[string]any)
+	if c["valid"] != true {
+		t.Fatalf("credential=%v", c)
+	}
+	models, _ := out["models"].([]any)
+	if len(models) != 2 {
+		t.Fatalf("限免模型应 2 个: %v", out)
+	}
+	if out["local_auth"] != false {
+		t.Fatalf("local_auth=%v", out["local_auth"])
+	}
+
+	// 面板页：内置版兜底
+	req2 := httptest.NewRequest(http.MethodGet, "/admin", nil)
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, req2)
+	if rec2.Code != 200 || !strings.Contains(rec2.Header().Get("Content-Type"), "text/html") {
+		t.Fatalf("status=%d ct=%s", rec2.Code, rec2.Header().Get("Content-Type"))
+	}
+
+	// 开 API_KEY 后：/admin 页面免鉴权（否则浏览器打不开面板），数据接口照常 401
+	srv2, _ := newTestServer(t, "stream", "k-local")
+	h2 := srv2.Handler()
+	rec3 := httptest.NewRecorder()
+	h2.ServeHTTP(rec3, httptest.NewRequest(http.MethodGet, "/admin", nil))
+	if rec3.Code != 200 {
+		t.Fatalf("/admin 应免鉴权 status=%d", rec3.Code)
+	}
+	rec4 := httptest.NewRecorder()
+	h2.ServeHTTP(rec4, httptest.NewRequest(http.MethodGet, "/admin/api/overview", nil))
+	if rec4.Code != 401 {
+		t.Fatalf("/admin/api/overview 应 401 status=%d", rec4.Code)
+	}
+}
+
 func TestNotFoundShape(t *testing.T) {
 	srv, _ := newTestServer(t, "stream", "")
 	// /v1/messages 误加 /v1 前缀的提示走 Anthropic 错误形状

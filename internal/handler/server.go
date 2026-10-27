@@ -80,6 +80,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/v1/completions", s.completions)
 	mux.HandleFunc("/login", s.login)
 	mux.HandleFunc("/login/status", s.loginStatus)
+	mux.HandleFunc("/admin", s.servePanel)
+	mux.HandleFunc("/admin/api/overview", s.adminOverview)
 	return s.auth(mux)
 }
 
@@ -89,7 +91,9 @@ func (s *Server) auth(next http.Handler) http.Handler {
 		rid := s.nextRID()
 		t0 := time.Now()
 
-		if s.Cfg.APIKey != "" && r.URL.Path != "/health" && r.URL.Path != "/" {
+		// /admin 页面本身不鉴权（HTML 无敏感数据，数据接口 /admin/api/* 照常要求 key），
+		// 否则开 API_KEY 后浏览器连面板都打不开，只剩一段 401 JSON。
+		if s.Cfg.APIKey != "" && r.URL.Path != "/health" && r.URL.Path != "/" && r.URL.Path != "/admin" {
 			auth := r.Header.Get("Authorization")
 			token := ""
 			if strings.HasPrefix(auth, "Bearer") {
@@ -142,6 +146,7 @@ func (s *Server) notFound(w http.ResponseWriter, r *http.Request) {
 			"endpoints": []string{
 				"POST /v1/chat/completions", "POST /v1/completions", "POST /v1/responses",
 				"POST /v1/messages", "GET /v1/models", "GET /health", "GET /login/status",
+				"GET /admin",
 			},
 		})
 		return
