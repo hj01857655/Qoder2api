@@ -26,6 +26,38 @@ go build -o qoder2api .
 | `GET /admin` | Web 管理面板（内置，开箱即用）：凭据状态、限免模型、device flow 登录。状态目录放一份自定义 `panel.html` 可覆盖内置版 |
 | `GET /admin/api/overview` | 面板概览 JSON：`{credential:{valid,email,name,uid,token_type,expire_text}, models, local_auth}` |
 
+### 协议适配（实测，模型 `DeepSeek-Flash`）
+
+| 能力 | chat/completions | responses | messages |
+|---|:---:|:---:|:---:|
+| 非流式 | ✅ | ✅ | ✅ |
+| 流式 | ✅ | ✅ | ✅ |
+| 工具调用 | ✅ | ✅ | ✅ |
+| 图片输入 | ✅ | ✅ | ✅ |
+| 思考内容 | ✅ | ✅ | ✅ |
+
+流式事件序列与字段映射经上游实测核对；能力判定以单次请求（排队窗口内）返回 200 为准。
+
+## 排队与重试
+
+`10605 / RESOURCE_LIMIT` 是**模型级容量信号**（`queueType:p3`、`serviceAvailable:false`），
+不是封号、也不是账号问题：同一模型的所有账号共享一个池，换号不解除排队，换模型或错峰才行。
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `QODER_QUEUE_WAIT_MODE` | `visible` | `visible` 等队列放行后重试；`fast` 立即返回 `503` + `Retry-After`/`retry_after`（实测 0.5s 返回）；`wait` 静默 sleep（旧行为） |
+| `QODER_QUEUE_MAX_ROUNDS` | `5` | 最多排队重试轮次 |
+| `QODER_QUEUE_WAIT_MAX_SECS` | `180` | 单轮等待上限（秒） |
+| `QODER_QUEUE_WAIT_BUDGET_SECS` | `300` | 整次请求总等待预算（秒） |
+| `QODER_CONNECT_RETRY_MAX_ELAPSED` | `150` | 连接类错误重试的耗时上限（秒） |
+
+排队等待期间每 5 秒检查客户端是否断开，断开即中止，不占住 worker。
+
+## 免费模型
+
+`/v1/models` 只列限免档：`Qwen3.8-Flash`（`is_free:true`、`price_factor:0`）、
+`DeepSeek-Flash`（同）。二者 180K 上下文、支持视觉；Qwen3.8-Flash 为推理模型。
+
 ## 配置（环境变量 > `.env` > 默认值）
 
 | 变量 | 默认 | 说明 |
@@ -40,7 +72,8 @@ go build -o qoder2api .
 
 ## 凭据
 
-单账号：`./qoder2api login` 或面板「重新登录」走 PKCE device flow，凭据落盘
+单账号：`./qoder2api login` 或面板「重新登录」走 PKCE device flow（S256 challenge + nonce；
+poll 走 OpenAPI 域，未授权时返回 404 属正常 pending），凭据落盘
 `<状态目录>/credentials.json`——把 exe 放进原 Qoder2api 目录（或设
 `QODER2API_STATE_DIR`）即可无缝接管 Python 版的凭据。双 token 族自动续期
 （job ← jrt- 短期、device ← drt- 长效）；每日签到线程按服务端轮次窗口自动领取积分。
