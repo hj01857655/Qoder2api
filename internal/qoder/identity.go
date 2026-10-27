@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"math/rand"
 	"net/http"
@@ -382,6 +383,26 @@ func Authorization(webHost, deviceClientID, machineID string) (string, string, s
 
 // PollDeviceToken 200 且 token 非空即成功；否则每 2s 再试，至超时。
 // 404 属正常（未授权时 poll 就返回 404）。
+// webRequest 发请求到 Web 域（qoder.cn）。device 授权族端点挂在 Web 域而不是
+// OpenAPI 域：实测 openapi.qoder.com.cn 返回 404，qoder.cn 返回 401/200。
+func (c *Client) webRequest(method, pathAndQuery string) (int, map[string]any) {
+	req, err := http.NewRequest(method, c.WebHost+pathAndQuery, nil)
+	if err != nil {
+		return 0, nil
+	}
+	req.Header.Set("User-Agent", "Qoder/"+proto.CosyVersion)
+	req.Header.Set("Accept", "application/json")
+	resp, err := c.httpc().Do(req)
+	if err != nil {
+		return 0, nil
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	var data map[string]any
+	_ = json.Unmarshal(raw, &data)
+	return resp.StatusCode, data
+}
+
 func (c *Client) PollDeviceToken(nonce, verifier string) map[string]any {
 	q := urlValues(map[string]string{
 		"nonce":            nonce,
@@ -391,6 +412,7 @@ func (c *Client) PollDeviceToken(nonce, verifier string) map[string]any {
 	endpoint := proto.DeviceTokenPollPath + "?" + q
 	deadline := time.Now().Add(signInTimeoutS * time.Second)
 	for time.Now().Before(deadline) {
+		// 官方实现：poll 在 OpenAPI 域，未授权时返回 404 属正常 pending（每 1s 重试，总超时 300s）
 		status, data := c.OpenAPIRequest(http.MethodGet, endpoint, nil, "", "")
 		if status == 200 {
 			if tok, _ := data["token"].(string); strings.TrimSpace(tok) != "" {
@@ -414,6 +436,11 @@ func (c *Client) PollDeviceToken(nonce, verifier string) map[string]any {
 func (c *Client) DeviceFlowSignIn() (*Credentials, error) {
 	machineID := c.ProcessMachineID()
 	authURL, verifier, nonce := Authorization(c.WebHost, proto.CNDeviceClientID, machineID)
+	// 把 nonce/verifier 落盘：进程被回收后可从文件恢复轮询，不必让用户重新点链接
+	statePath := filepath.Join(filepath.Dir(c.CredPath), "pending-login.json")
+	if raw, err := json.Marshal(map[string]string{"nonce": nonce, "verifier": verifier, "auth_url": authURL, "machine_id": machineID}); err == nil {
+		_ = os.WriteFile(statePath, raw, 0o600)
+	}
 	c.logf("无本地凭证（credentials.json 缺失或不可用），需登录。请在浏览器授权（%ds 内）:\n  %s", signInTimeoutS, authURL)
 
 	dt := c.PollDeviceToken(nonce, verifier)
@@ -428,6 +455,7 @@ func (c *Client) DeviceFlowSignIn() (*Credentials, error) {
 	} else if f, ok := dt["user_id"].(float64); ok {
 		uid = fmt.Sprint(int64(f))
 	}
+	_ = os.Remove(filepath.Join(filepath.Dir(c.CredPath), "pending-login.json"))
 	cred := CredApplied(dt, &Credentials{Source: "device", MachineID: machineID, UID: uid}, "device")
 	if cred == nil {
 		return nil, errors.New("device token 响应无 token")
