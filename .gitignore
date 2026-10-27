@@ -11,3 +11,7 @@ credentials.json
 .cred/
 .env
 .env.*
+pending-login.json
+device-token.json
+qoder-run.log
+poll-device.js

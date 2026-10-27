@@ -92,10 +92,44 @@ func (s *Server) ensureModel(w http.ResponseWriter, modelReq string, anthropicSh
 // ── 重试决策（对应 Python _rate_limit_wait / _connect_wait / _retry_wait） ────
 
 const (
-	rateLimitMaxRetries = 2   // 最多重试次数，防长时间占住 worker
-	rateLimitMaxWait    = 60  // waitTime 超过此值不睡等（可能真过载），直接透传错误
-	connectRetryWait    = 2.0 // 连接类错误短退避
+	// 排队重试：10605/RESOURCE_LIMIT 是模型级容量信号（不是封号），实测常需
+	// 3~5 轮 × 30s 才排到。默认 5 轮、单次等待上限 180s、总预算 300s，
+	// 都可用环境变量覆盖（对齐 qoder2api-hub 的 QD_QUEUE_* 语义）。
+	defaultQueueMaxRounds = 5
+	defaultQueueMaxWait   = 180
+	defaultQueueBudget    = 300
+	connectRetryWait      = 2.0 // 连接类错误短退避
 )
+
+var (
+	rateLimitMaxRetries = envInt("QODER_QUEUE_MAX_ROUNDS", defaultQueueMaxRounds)
+	rateLimitMaxWait    = envFloat("QODER_QUEUE_WAIT_MAX_SECS", defaultQueueMaxWait)
+	queueWaitBudget     = envFloat("QODER_QUEUE_WAIT_BUDGET_SECS", defaultQueueBudget)
+	// queueMode 排队策略（对齐 qoder2api-hub 的 QD_QUEUE_WAIT_MODE）：
+	//   visible —— 流式先发头，排队期间发心跳/提示，客户端能看到进度（默认）
+	//   fast    —— 不等，直接 503 + Retry-After，让客户端自己重试
+	//   wait    —— 静默 sleep（旧行为，客户端零字节会"卡住"，仅兼容保留）
+	queueMode = strings.ToLower(strings.TrimSpace(orDefault(os.Getenv("QODER_QUEUE_WAIT_MODE"), "visible")))
+)
+
+// queueFast 是否快速失败模式（非 visible/wait 的未知值按 visible 处理）。
+func queueFast() bool { return queueMode == "fast" }
+
+func orDefault(s, def string) string {
+	if s == "" {
+		return def
+	}
+	return s
+}
+
+func envInt(name string, def int) int {
+	if v := strings.TrimSpace(os.Getenv(name)); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return def
+}
 
 var waitTimeRe = regexp.MustCompile(`"(waitTime|retryAfterSeconds)"\s*:\s*(\d+(?:\.\d+)?)`)
 
@@ -116,6 +150,9 @@ func rateLimitWait(e error) float64 {
 	}
 	return 0
 }
+
+// 说明：总预算 queueWaitBudget 的扣减在调用方的重试循环里做（见 chatDirectLines
+// 与 direct 系列的 budget 变量），这里只负责把单次等待时长解析出来。
 
 // connectErrSigns 连接类错误特征（依赖引擎把两类都包成 "upstream request failed: …"）。
 var connectErrSigns = []string{"Max retries", "SSLEOFError", "SSLError", "ConnectionError",
@@ -316,6 +353,15 @@ func (s *Server) chatDirectLines(ctx context.Context, p chatParams, cid string, 
 				break
 			}
 			wait := retryWait(upErr, time.Since(t0).Seconds())
+			// fast 模式：不等队列，直接告诉客户端多久后来（避免同步 HTTP 长时间挂住）
+			if wait > 0 && queueFast() && !produced {
+				errored = true
+				s.Log.Warn(fmt.Sprintf("%s 排队(fast) %ds 后客户端可重试", rid, int(wait)))
+				yield("data: " + string(marshalCompact(map[string]any{"error": map[string]any{
+					"message": fmt.Sprintf("上游模型排队中，请 %d 秒后重试（模型级容量限制，与账号无关）", int(wait)),
+					"type":    "rate_limit_error", "code": 503}})) + "\n\n")
+				break
+			}
 			if produced || attempts >= rateLimitMaxRetries || wait <= 0 {
 				errored = true
 				s.Log.Warn(rid + " direct stream upstream error: " + upErr.Error())
@@ -440,6 +486,16 @@ func (s *Server) fullChatDirect(ctx context.Context, p chatParams, cid string, n
 			break
 		}
 		wait := retryWait(upErr, time.Since(t0).Seconds())
+		// fast 模式：不睡队列，直接回 503 + Retry-After 让客户端自己重试
+		if wait > 0 && queueFast() {
+			s.Log.Warn(fmt.Sprintf("%s 排队(fast) %ds 后客户端可重试", rid, int(wait)))
+			return map[string]any{"error": map[string]any{
+				"message":     fmt.Sprintf("上游模型排队中，请 %d 秒后重试（模型级容量限制，与账号无关）", int(wait)),
+				"type":        "rate_limit_error",
+				"code":        503,
+				"retry_after": int(wait),
+			}}, false
+		}
 		if attempts >= rateLimitMaxRetries || wait <= 0 {
 			s.Log.Warn(rid + " direct upstream error: " + upErr.Error())
 			return map[string]any{"error": map[string]any{
